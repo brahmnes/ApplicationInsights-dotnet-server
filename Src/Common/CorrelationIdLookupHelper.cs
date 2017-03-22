@@ -7,12 +7,14 @@
     using System.Net;
     using System.Threading.Tasks;
     using Extensibility;
-    using Extensibility.Implementation.Tracing;
+#if NETCORE
+    using System.Net.Http;
+#endif
 
     /// <summary>
     /// A store for instrumentation App Ids. This makes sure we don't query the public endpoint to find an app Id for the same instrumentation key more than once.
     /// </summary>
-    internal class CorrelationIdLookupHelper
+    internal class CorrelationIdLookupHelper : ICorrelationIdLookupHelper
     {
         /// <summary>
         /// Max number of app ids to cache.
@@ -28,16 +30,9 @@
 
         private const string AppIdQueryApiRelativeUriFormat = "api/profiles/{0}/appId";
 
-        // We have arbitrarily chosen 5 second delay between trying to get app Id once we get a failure while trying to get it. 
-        // This is to throttle tries between failures to safeguard against performance hits. The impact would be that telemetry generated during this interval would not have x-component correlation id.
-        private readonly TimeSpan intervalBetweenFailedRetries = TimeSpan.FromSeconds(5);
-
         private Uri endpointAddress;
 
         private ConcurrentDictionary<string, string> knownCorrelationIds = new ConcurrentDictionary<string, string>();
-
-        // Stores failed instrumentation keys along with the time we tried to retrieve them.
-        private ConcurrentDictionary<string, DateTime> failingInstrumenationKeys = new ConcurrentDictionary<string, DateTime>();
 
         private Func<string, Task<string>> provideAppId;
 
@@ -105,16 +100,6 @@
 
                 try
                 {
-                    DateTime lastTriedTime;
-                    if (this.failingInstrumenationKeys.TryGetValue(instrumentationKey, out lastTriedTime))
-                    {
-                        if (DateTime.UtcNow - lastTriedTime <= this.intervalBetweenFailedRetries)
-                        {
-                            // We tried not too long ago and failed to retrieve app Id for this instrumentation key from breeze. Let wait a while before we try again. For now just report failure.
-                            correlationId = string.Empty;
-                            return false;
-                        }
-                    }
 
                     // We wait for <getAppIdTimeout> seconds (which is 0 at this point) to retrieve the appId. If retrieved during that time, we return success setting the correlation id.
                     // If we are still waiting on the result beyond the timeout - for this particular call we return the failure but queue a task continuation for it to be cached for next time.
@@ -135,8 +120,7 @@
                             }
                             catch (Exception ex)
                             {
-                                this.failingInstrumenationKeys[instrumentationKey] = DateTime.UtcNow;
-                                CrossComponentCorrelationEventSource.Log.FetchAppIdFailed(this.GetExceptionDetailString(ex));
+                                CrossComponentCorrelationEventSource.Log.FetchAppIdFailed(CrossComponentCorrelationEventSource.GetExceptionDetailString(ex));
                             }
                         });
 
@@ -145,8 +129,7 @@
                 }
                 catch (Exception ex)
                 {
-                    this.failingInstrumenationKeys[instrumentationKey] = DateTime.UtcNow;
-                    CrossComponentCorrelationEventSource.Log.FetchAppIdFailed(this.GetExceptionDetailString(ex));
+                    CrossComponentCorrelationEventSource.Log.FetchAppIdFailed(CrossComponentCorrelationEventSource.GetExceptionDetailString(ex));
 
                     correlationId = string.Empty;
                     return false;
@@ -168,24 +151,31 @@
         {
             try
             {
+#if !NETCORE
                 SdkInternalOperationsMonitor.Enter();
-
+#endif
                 Uri appIdEndpoint = this.GetAppIdEndPointUri(instrumentationKey);
-
+#if !NETCORE
                 WebRequest request = WebRequest.Create(appIdEndpoint);
                 request.Method = "GET";
 
                 using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
+                using (StreamReader reader = new StreamReader(response.GetResponseStream()))
                 {
-                    using (StreamReader reader = new StreamReader(response.GetResponseStream()))
-                    {
-                        return await reader.ReadToEndAsync();
-                    }
+                    return await reader.ReadToEndAsync();
                 }
+#else
+                using (HttpClient client = new HttpClient())
+                {
+                    return await client.GetStringAsync(appIdEndpoint).ConfigureAwait(false);
+                }
+#endif
             }
             finally
             {
+#if !NETCORE
                 SdkInternalOperationsMonitor.Exit();
+#endif
             }
         }
 
@@ -197,17 +187,6 @@
         private Uri GetAppIdEndPointUri(string instrumentationKey)
         {
             return new Uri(this.endpointAddress, string.Format(CultureInfo.InvariantCulture, AppIdQueryApiRelativeUriFormat, instrumentationKey));
-        }
-
-        private string GetExceptionDetailString(Exception ex)
-        {
-            var ae = ex as AggregateException;
-            if (ae != null)
-            {
-                return ae.Flatten().InnerException.ToInvariantString();
-            }
-
-            return ex.ToInvariantString();
         }
     }
 }
